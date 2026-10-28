@@ -6,7 +6,7 @@ import pandas as pd
 DIRETORIO_ATUAL = Path('C:/dados_inep')
 
 DIRETORIO_MICRODADOS = DIRETORIO_ATUAL / "data_cen" / "Microdados da Educação Básica"
-DIRETORIO_PROCESSADOS = DIRETORIO_ATUAL / "dados_processados"
+DIRETORIO_PROCESSADOS = DIRETORIO_ATUAL  / "data_cen" / "dados_processados"
 ARQUIVO_DICIONARIO_MESTRE = DIRETORIO_PROCESSADOS / "dicionario_unificado.csv"
 
 ANO_MIN, ANO_MAX = 1996, 2006

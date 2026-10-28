@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib3.util import Retry
 import requests
 import sys
 from bs4 import BeautifulSoup
@@ -223,7 +223,7 @@ def executar_scrapper(session):
     print(f"O algoritmo rodou em: {end_time - start_time:.6f} segundos")
 
 
-def main():
+def main_scrapper():
     try:
         with session() as sessao:
             executar_scrapper(sessao)
@@ -232,4 +232,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    main_scrapper()
