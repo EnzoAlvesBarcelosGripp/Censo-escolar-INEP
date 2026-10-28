@@ -2,14 +2,16 @@
 Gera os CSVs do modelo relacional (DDL de 1996) a partir de CENSOESC_1996.CSV.
 
 Entrada : CENSOESC_1996.CSV (delimitador '|', uma linha por escola, ~800 colunas)
-Saída   : uma pasta 'tabelas_1996' ao lado da pasta do ano (mesmo nível de '1996/'):
-            dim_estado.csv, dim_municipio.csv, dim_etapa.csv,
-            ie_ano.csv, ie_infra_ano.csv, ie_etapa_ano.csv,
-            ie_pne_modalidade_ano.csv, ie_pne_deficiencia_ano.csv
+Saída   : na mesma pasta do arquivo de entrada (…/1996/), um CSV por tabela, com o nome da tabela:
+            estado.csv, municipio.csv, etapa.csv,
+            escola.csv, infraestrutura.csv, escola_etapa.csv,
+            pne_modalidade.csv, pne_deficiencia.csv
+          As colunas tec_* e supl_prof_* de escola.csv vêm de EM8_1996, EM11_1996 e ES6_1996
+          (mesma pasta do CENSOESC_1996), somadas por escola.
 
 Como funciona (resumo):
   1. lê o arquivo em blocos (chunks) e só as colunas necessárias -> memória baixa;
-  2. cada bloco vira as tabelas "largas" (ie_ano, ie_infra_ano) e "longas" (ie_etapa_ano, PNE);
+  2. cada bloco vira as tabelas "largas" (escola, infraestrutura) e "longas" (escola_etapa, PNE);
   3. as dimensões (estado, município) são acumuladas durante a leitura e gravadas no fim;
   4. os CSVs são gravados em arquivo temporário e só viram definitivos no final
      (se der erro no meio, não sobra CSV pela metade).
@@ -37,13 +39,12 @@ logger = logging.getLogger("tabelas_1996")
 ANO = 1996
 ENTRADA_PADRAO = Path("C:/dados_inep/data_cen/Microdados da Educação Básica/1996/CENSOESC_1996")
 NOME_BASE = "censoesc_1996"
-PASTA_SAIDA = "tabelas_1996"
 SEP_ENTRADA = "|"
 
 # ---------------------------------------------------------------------------
 # 1. Constantes do modelo
 # ---------------------------------------------------------------------------
-# Código IBGE da UF (usado só para preencher dim_estado.co_uf)
+# Código IBGE da UF (usado só para preencher estado.co_uf)
 CO_UF_IBGE = {
     "RO": 11, "AC": 12, "AM": 13, "RR": 14, "PA": 15, "AP": 16, "TO": 17,
     "MA": 21, "PI": 22, "CE": 23, "RN": 24, "PB": 25, "PE": 26, "AL": 27, "SE": 28, "BA": 29,
@@ -64,8 +65,12 @@ DIM_ETAPA = [
 
 COLS_ESTADO = ["sigla_uf", "nome_uf", "co_uf"]
 COLS_MUNICIPIO = ["cod_municipio", "nome_municipio", "sigla_uf"]
+# agregados dos arquivos EM8/EM11/ES6 (grão escola x curso), somados por escola
+COLS_EXTRA_ESCOLA = ["tec_cursos", "tec_matriculas", "tec_concluintes_ant",
+                     "supl_prof_matriculas_s1_ant", "supl_prof_concluintes_s1_ant",
+                     "supl_prof_matriculas_s2_ant", "supl_prof_concluintes_s2_ant"]
 COLS_IE = ["ano", "id_ie", "id_estavel", "cod_municipio", "sigla_uf", "dependencia", "localizacao",
-           "cond_funcionamento", "reg_cnas", "niveis", "modalidades", "funcionarios"]
+           "cond_funcionamento", "reg_cnas", "niveis", "modalidades", "funcionarios"] + COLS_EXTRA_ESCOLA
 COLS_INFRA = ["ano", "id_ie", "salas_existentes_perm", "salas_existentes_prov",
               "salas_utilizadas_no_estab", "salas_utilizadas_fora"]
 MEDIDAS_ETAPA = ["turmas", "turmas_multisseriadas", "matriculas", "matriculas_masc", "matriculas_fem",
@@ -249,7 +254,7 @@ def soma(df: pd.DataFrame, cols: list[str]) -> pd.Series:
 # ---------------------------------------------------------------------------
 # 4. Construção das tabelas de um bloco (chunk)
 # ---------------------------------------------------------------------------
-def montar_ie(df: pd.DataFrame, num: pd.DataFrame) -> pd.DataFrame:
+def montar_ie(df: pd.DataFrame, num: pd.DataFrame, extra: pd.DataFrame) -> pd.DataFrame:
     letras = pd.DataFrame({
         "P": flag(df["NIVELPRE"]),
         "I": flag(df["NIVELCA"]) | flag(df["NIV_F1A4_8"]),
@@ -259,7 +264,7 @@ def montar_ie(df: pd.DataFrame, num: pd.DataFrame) -> pd.DataFrame:
     niveis = letras.apply(lambda r: "".join(k for k, v in r.items() if v), axis=1)
     mod = pd.DataFrame({"R": flag(df["ENSREGULAR"]), "E": flag(df["ENSESPECIAL"]), "S": flag(df["ENSSUPLET"])})
     modalidades = mod.apply(lambda r: "".join(k for k, v in r.items() if v), axis=1)
-    return pd.DataFrame({
+    out = pd.DataFrame({
         "ano": ANO,
         "id_ie": df["id_ie"],
         "id_estavel": 0,
@@ -272,7 +277,9 @@ def montar_ie(df: pd.DataFrame, num: pd.DataFrame) -> pd.DataFrame:
         "niveis": niveis.replace("", pd.NA),
         "modalidades": modalidades.replace("", pd.NA),
         "funcionarios": num["FUNCION"],
-    })[COLS_IE]
+    })
+    out = out.merge(extra, left_on="id_ie", right_index=True, how="left")
+    return out[COLS_IE]
 
 
 def montar_infra(df: pd.DataFrame, num: pd.DataFrame) -> pd.DataFrame:
@@ -371,6 +378,79 @@ def montar_pne(df: pd.DataFrame, num: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
 
 
 # ---------------------------------------------------------------------------
+# 4b. EM8, EM11, ES6 (grão escola x curso) agregados por escola
+# ---------------------------------------------------------------------------
+ARQUIVO_EM8, ARQUIVO_EM11, ARQUIVO_ES6 = "em8_1996", "em11_1996", "es6_1996"
+EM8_MATRICULAS = [f"EM81{i}" for i in "45678"]        # 1ª-4ª série + não seriado (matrícula de 1996)
+EM11_CONCLUINTES = [f"EM111{i}" for i in "12345"]     # 5 coortes somadas (concluintes de 1995)
+ES6_SEMESTRES = {1: ("ES611", "ES612"), 2: ("ES613", "ES614")}   # (matriculados, concluintes) - tudo de 1995
+
+
+def localizar_arquivo_curso(pasta: Path, stem: str) -> Path | None:
+    achados = sorted(p for p in pasta.rglob("*") if p.is_file() and p.stem.lower() == stem)
+    return achados[0] if achados else None
+
+
+def ler_curso(pasta: Path, stem: str, variaveis: list[str], encoding: str,
+              rejeitados: dict[str, int]) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """Devolve (chaves, números) alinhados; chaves = id_ie, cod_curso. None se o arquivo não existe."""
+    caminho = localizar_arquivo_curso(pasta, stem)
+    if caminho is None:
+        logger.warning("%s não encontrado em %s -> arquivo ignorado", stem.upper(), pasta)
+        return None
+    precisa = {"MASCARA", "CODCURSO", *variaveis}
+    cab = {_limpar_nome(c) for c in pd.read_csv(caminho, sep=SEP_ENTRADA, encoding=encoding,
+                                                encoding_errors="replace", nrows=0).columns}
+    if precisa - cab:
+        logger.warning("%s: colunas ausentes %s -> arquivo ignorado", caminho.name, sorted(precisa - cab))
+        return None
+    df = pd.read_csv(caminho, sep=SEP_ENTRADA, encoding=encoding, encoding_errors="replace", dtype=str,
+                     usecols=lambda c: _limpar_nome(c) in precisa)
+    df.columns = [_limpar_nome(c) for c in df.columns]
+    masc = texto(df["MASCARA"])
+    df = df[masc.notna()].reset_index(drop=True)
+    chaves = pd.DataFrame({"id_ie": f"MASC{ANO}_" + texto(df["MASCARA"]), "cod_curso": texto(df["CODCURSO"])})
+    logger.info("%s: %d linhas", caminho.name, len(df))
+    return chaves, numero(df, variaveis, rejeitados)
+
+
+def por_escola(chaves: pd.DataFrame, valores: pd.Series, nome: str) -> pd.Series:
+    """Soma o valor de todos os cursos da escola (vazio se nenhum curso informou)."""
+    return valores.groupby(chaves["id_ie"]).sum(min_count=1).rename(nome)
+
+
+def montar_extra_escola(pasta: Path, encoding: str, rejeitados: dict[str, int]) -> pd.DataFrame:
+    """Colunas extras de `escola` (índice = id_ie), vindas dos arquivos de curso."""
+    series: list[pd.Series] = []
+    cursos: list[pd.DataFrame] = []
+
+    em8 = ler_curso(pasta, ARQUIVO_EM8, EM8_MATRICULAS, encoding, rejeitados)
+    if em8:
+        ch, nu = em8
+        series.append(por_escola(ch, soma(nu, EM8_MATRICULAS), "tec_matriculas"))
+        cursos.append(ch.dropna(subset=["cod_curso"]))
+    em11 = ler_curso(pasta, ARQUIVO_EM11, EM11_CONCLUINTES, encoding, rejeitados)
+    if em11:
+        ch, nu = em11
+        series.append(por_escola(ch, soma(nu, EM11_CONCLUINTES), "tec_concluintes_ant"))
+        cursos.append(ch.dropna(subset=["cod_curso"]))
+    if cursos:                                     # nº de cursos técnicos distintos da escola (EM8 ∪ EM11)
+        todos = pd.concat(cursos, ignore_index=True).drop_duplicates()
+        series.append(todos.groupby("id_ie").size().rename("tec_cursos"))
+
+    es6 = ler_curso(pasta, ARQUIVO_ES6, [v for par in ES6_SEMESTRES.values() for v in par], encoding, rejeitados)
+    if es6:
+        ch, nu = es6
+        for sem, (vm, vc) in ES6_SEMESTRES.items():
+            series.append(por_escola(ch, nu[vm], f"supl_prof_matriculas_s{sem}_ant"))
+            series.append(por_escola(ch, nu[vc], f"supl_prof_concluintes_s{sem}_ant"))
+
+    extra = pd.concat(series, axis=1) if series else pd.DataFrame(index=pd.Index([], name="id_ie"))
+    extra.index.name = "id_ie"
+    return extra.reindex(columns=COLS_EXTRA_ESCOLA)
+
+
+# ---------------------------------------------------------------------------
 # 5. Escrita segura (arquivo temporário -> rename no final)
 # ---------------------------------------------------------------------------
 class Escritor:
@@ -420,7 +500,7 @@ def gravar_dimensoes(pares_mun: list[pd.DataFrame], pasta: Path, sep: str) -> tu
     conflito_nome = cont.groupby("cod_municipio")["nome_municipio"].nunique()
     if (conflito_uf > 1).any():
         logger.warning("%d CODMUNIC aparecem em mais de uma UF -> CODMUNIC é código LOCAL; a chave de "
-                       "dim_municipio precisa ser (sigla_uf, cod_municipio). Exemplos: %s",
+                       "municipio precisa ser (sigla_uf, cod_municipio). Exemplos: %s",
                        int((conflito_uf > 1).sum()), list(conflito_uf[conflito_uf > 1].index[:5]))
     if (conflito_nome > 1).any():
         logger.warning("%d CODMUNIC com mais de um nome de município (mantido o mais frequente). Exemplos: %s",
@@ -436,10 +516,10 @@ def gravar_dimensoes(pares_mun: list[pd.DataFrame], pasta: Path, sep: str) -> tu
         logger.warning("Siglas sem código IBGE conhecido: %s", desconhecidas)
     est = est[COLS_ESTADO].sort_values("sigla_uf").reset_index(drop=True)
 
-    est.to_csv(pasta / "dim_estado.csv", index=False, sep=sep, encoding="utf-8")
-    mun.to_csv(pasta / "dim_municipio.csv", index=False, sep=sep, encoding="utf-8")
+    est.to_csv(pasta / "estado.csv", index=False, sep=sep, encoding="utf-8")
+    mun.to_csv(pasta / "municipio.csv", index=False, sep=sep, encoding="utf-8")
     pd.DataFrame(DIM_ETAPA, columns=["etapa", "descricao", "etapa_ampla"]).to_csv(
-        pasta / "dim_etapa.csv", index=False, sep=sep, encoding="utf-8")
+        pasta / "etapa.csv", index=False, sep=sep, encoding="utf-8")
     return est, mun
 
 
@@ -451,16 +531,16 @@ def main() -> int:
     ap.add_argument("--entrada", type=Path, default=ENTRADA_PADRAO,
                     help="arquivo CENSOESC_1996 (com ou sem extensão) ou pasta (padrão: %(default)s)")
     ap.add_argument("--saida", type=Path, default=None,
-                    help="pasta de saída (padrão: 'tabelas_1996' ao lado da pasta do arquivo de entrada)")
+                    help="pasta de saída (padrão: a mesma pasta do arquivo de entrada, ex.: ...\\1996)")
     ap.add_argument("--encoding", default="utf-8-sig")
     ap.add_argument("--sep-saida", default=",")
     ap.add_argument("--chunk", type=int, default=50_000, help="linhas por bloco de leitura")
-    ap.add_argument("--so-dimensoes", action="store_true", help="gera apenas dim_estado, dim_municipio e dim_etapa")
+    ap.add_argument("--so-dimensoes", action="store_true", help="gera apenas estado, municipio e etapa")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     entrada = localizar_entrada(args.entrada)
-    pasta = args.saida or (entrada.parent.parent / PASTA_SAIDA)
+    pasta = args.saida or entrada.parent
     pasta.mkdir(parents=True, exist_ok=True)
     logger.info("Entrada: %s", entrada)
     logger.info("Saída  : %s", pasta)
@@ -470,11 +550,11 @@ def main() -> int:
     validar_cabecalho(entrada, args.encoding, precisa)
 
     escritores = {} if args.so_dimensoes else {
-        "ie_ano": Escritor(pasta, "ie_ano", COLS_IE, args.sep_saida),
-        "ie_infra_ano": Escritor(pasta, "ie_infra_ano", COLS_INFRA, args.sep_saida),
-        "ie_etapa_ano": Escritor(pasta, "ie_etapa_ano", COLS_ETAPA, args.sep_saida),
-        "ie_pne_modalidade_ano": Escritor(pasta, "ie_pne_modalidade_ano", COLS_PNE_MOD, args.sep_saida),
-        "ie_pne_deficiencia_ano": Escritor(pasta, "ie_pne_deficiencia_ano", COLS_PNE_DEF, args.sep_saida),
+        "escola": Escritor(pasta, "escola", COLS_IE, args.sep_saida),
+        "infraestrutura": Escritor(pasta, "infraestrutura", COLS_INFRA, args.sep_saida),
+        "escola_etapa": Escritor(pasta, "escola_etapa", COLS_ETAPA, args.sep_saida),
+        "pne_modalidade": Escritor(pasta, "pne_modalidade", COLS_PNE_MOD, args.sep_saida),
+        "pne_deficiencia": Escritor(pasta, "pne_deficiencia", COLS_PNE_DEF, args.sep_saida),
     }
 
     vistos: set[str] = set()
@@ -483,6 +563,9 @@ def main() -> int:
     conf = {e: {"comparaveis": 0, "iguais": 0} for e in SEXO}
     lidas = sem_chave = duplicadas = sem_municipio = 0
     t0 = time.perf_counter()
+    extra = pd.DataFrame(index=pd.Index([], name="id_ie"), columns=COLS_EXTRA_ESCOLA)
+    if not args.so_dimensoes:
+        extra = montar_extra_escola(pasta, args.encoding, rejeitados)
 
     leitor = pd.read_csv(entrada, sep=SEP_ENTRADA, encoding=args.encoding, encoding_errors="replace",
                          dtype=str, usecols=lambda c: _limpar_nome(c) in precisa, chunksize=args.chunk,
@@ -517,17 +600,20 @@ def main() -> int:
 
         if not args.so_dimensoes:
             num = numero(chunk, numericas, rejeitados)
-            escritores["ie_ano"].escrever(montar_ie(chunk, num))
-            escritores["ie_infra_ano"].escrever(montar_infra(chunk, num))
-            escritores["ie_etapa_ano"].escrever(montar_etapa(chunk, num, conf))
+            escritores["escola"].escrever(montar_ie(chunk, num, extra))
+            escritores["infraestrutura"].escrever(montar_infra(chunk, num))
+            escritores["escola_etapa"].escrever(montar_etapa(chunk, num, conf))
             mod, de = montar_pne(chunk, num)
-            escritores["ie_pne_modalidade_ano"].escrever(mod)
-            escritores["ie_pne_deficiencia_ano"].escrever(de)
+            escritores["pne_modalidade"].escrever(mod)
+            escritores["pne_deficiencia"].escrever(de)
         logger.info("%d linhas lidas (%.0f s)", lidas, time.perf_counter() - t0)
 
     if not pares_mun:
         raise SystemExit("Nenhuma escola válida encontrada.")
     est, mun = gravar_dimensoes(pares_mun, pasta, args.sep_saida)
+    sem_escola = int((~extra.index.isin(vistos)).sum())
+    if sem_escola:
+        logger.warning("%d escolas dos arquivos EM8/EM11/ES6 não existem no CENSOESC e foram ignoradas", sem_escola)
     for e in escritores.values():
         e.fechar()
 
@@ -535,7 +621,7 @@ def main() -> int:
     print("\n" + "=" * 70)
     print(f"Linhas lidas: {lidas} | sem MASCARA: {sem_chave} | MASCARA repetida: {duplicadas} | "
           f"sem CODMUNIC: {sem_municipio}")
-    print(f"dim_estado: {len(est)} | dim_municipio: {len(mun)} | dim_etapa: {len(DIM_ETAPA)}")
+    print(f"estado: {len(est)} | municipio: {len(mun)} | etapa: {len(DIM_ETAPA)}")
     for nome, e in escritores.items():
         print(f"{nome}: {e.linhas} linhas")
     if rejeitados:
