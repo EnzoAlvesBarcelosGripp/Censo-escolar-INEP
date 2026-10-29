@@ -1,25 +1,22 @@
 """
-Gera os CSVs do modelo relacional (DDL de 1996) a partir de CENSOESC_1996.CSV.
+Gera os CSVs do bloco 1996 (DDL 03_b1996.sql) a partir de CENSOESC_1996.CSV.
 
 Entrada : CENSOESC_1996.CSV (delimitador '|', uma linha por escola, ~800 colunas)
-Saída   : na mesma pasta do arquivo de entrada (…/1996/), um CSV por tabela, com o nome da tabela:
-            estado.csv, municipio.csv, etapa.csv,
-            escola.csv, infraestrutura.csv, escola_etapa.csv,
-            pne_modalidade.csv, pne_deficiencia.csv
-          As colunas tec_* e supl_prof_* de escola.csv vêm de EM8_1996, EM11_1996 e ES6_1996
-          (mesma pasta do CENSOESC_1996), somadas por escola.
+          + dim/municipio.csv gerado por gerar_dim.py (para trocar CODMUNIC pelo código IBGE)
+          + EM8_1996, EM11_1996 e ES6_1996 (mesma pasta do CENSOESC; colunas tec_* e supl_prof_* de escola)
+Saída   : na mesma pasta do arquivo de entrada (…/1996/), um CSV por tabela do schema b1996:
+            escola.csv, infraestrutura.csv, escola_etapa.csv, pne_modalidade.csv, pne_deficiencia.csv
+          As dimensões (estado, município, domínios, etapas) não são geradas aqui: ver gerar_dim.py e 01_dim.sql.
 
-Como funciona (resumo):
-  1. lê o arquivo em blocos (chunks) e só as colunas necessárias -> memória baixa;
-  2. cada bloco vira as tabelas "largas" (escola, infraestrutura) e "longas" (escola_etapa, PNE);
-  3. as dimensões (estado, município) são acumuladas durante a leitura e gravadas no fim;
-  4. os CSVs são gravados em arquivo temporário e só viram definitivos no final
-     (se der erro no meio, não sobra CSV pela metade).
+Regras:
+  - turnos diurno + noturno somados; a CA é uma etapa própria ('ca') e 'fund_ini' = 1ª a 4ª série;
+  - dependência, situação e localização gravadas como código dos domínios (dim.*);
+  - nada é descartado em silêncio: escola sem MASCARA, MASCARA repetida, CODMUNIC vazio ou sem código IBGE,
+    UF diferente da do município ou valor de domínio desconhecido fazem o script PARAR e informar.
 
 Exemplos:
   python gerar_tabelas_1996.py
-  python gerar_tabelas_1996.py --entrada "D:/outro/lugar/CENSOESC_1996.CSV"
-  python gerar_tabelas_1996.py --so-dimensoes
+  python gerar_tabelas_1996.py --entrada "D:/outro/lugar/CENSOESC_1996.CSV" --municipios "D:/dim/municipio.csv"
 """
 from __future__ import annotations
 
@@ -38,47 +35,34 @@ logger = logging.getLogger("tabelas_1996")
 
 ANO = 1996
 ENTRADA_PADRAO = Path("C:/dados_inep/data_cen/Microdados da Educação Básica/1996/CENSOESC_1996")
+MUNICIPIOS_PADRAO = Path("C:/dados_inep/data_cen/dados_processados/dim/municipio.csv")
 NOME_BASE = "censoesc_1996"
 SEP_ENTRADA = "|"
 
 # ---------------------------------------------------------------------------
 # 1. Constantes do modelo
 # ---------------------------------------------------------------------------
-# Código IBGE da UF (usado só para preencher estado.co_uf)
-CO_UF_IBGE = {
-    "RO": 11, "AC": 12, "AM": 13, "RR": 14, "PA": 15, "AP": 16, "TO": 17,
-    "MA": 21, "PI": 22, "CE": 23, "RN": 24, "PB": 25, "PE": 26, "AL": 27, "SE": 28, "BA": 29,
-    "MG": 31, "ES": 32, "RJ": 33, "SP": 35, "PR": 41, "SC": 42, "RS": 43,
-    "MS": 50, "MT": 51, "GO": 52, "DF": 53,
-}
+# códigos dos domínios (iguais aos inseridos por 01_dim.sql): texto de 1996 -> código
+DOM_DEPENDENCIA = {"Federal": 1, "Estadual": 2, "Municipal": 3, "Particular": 4}
+DOM_SITUACAO = {"Ativo": 1, "Paralisado": 2, "Extinto": 3}
+DOM_LOCALIZACAO = {"Urbana": 1, "Rural": 2}
 
-DIM_ETAPA = [
-    ("pre", "Pré-escolar (períodos 1 a 3)", "infantil"),
-    ("fund_ini", "Fundamental anos iniciais (CA + 1ª a 4ª série)", "fundamental"),
-    ("fund_fin", "Fundamental anos finais (5ª a 8ª série)", "fundamental"),
-    ("fund_total", "Fundamental sem separar iniciais/finais", "fundamental"),
-    ("medio", "Ensino médio (1ª a 4ª série + não seriada)", "medio"),
-    ("especial", "Educação especial", "especial"),
-    ("supletivo_s1", "Supletivo - 1º semestre", "supletivo"),
-    ("supletivo_s2", "Supletivo - 2º semestre", "supletivo"),
-]
-
-COLS_ESTADO = ["sigla_uf", "nome_uf", "co_uf"]
-COLS_MUNICIPIO = ["cod_municipio", "nome_municipio", "sigla_uf"]
 # agregados dos arquivos EM8/EM11/ES6 (grão escola x curso), somados por escola
-COLS_EXTRA_ESCOLA = ["tec_cursos", "tec_matriculas", "tec_concluintes_ant",
+COLS_EXTRA_ESCOLA = ["tec_matriculas", "tec_concluintes_ant",
                      "supl_prof_matriculas_s1_ant", "supl_prof_concluintes_s1_ant",
                      "supl_prof_matriculas_s2_ant", "supl_prof_concluintes_s2_ant"]
-COLS_IE = ["ano", "id_ie", "id_estavel", "cod_municipio", "sigla_uf", "dependencia", "localizacao",
-           "cond_funcionamento", "reg_cnas", "niveis", "modalidades", "funcionarios"] + COLS_EXTRA_ESCOLA
+COLS_FLAGS_ESCOLA = ["nivel_pre", "nivel_ca", "nivel_fund_ini", "nivel_fund_fin", "nivel_medio",
+                     "mod_regular", "mod_especial", "mod_supletivo"]
+COLS_IE = ["ano", "id_ie", "cod_municipio", "sigla_uf", "dependencia", "situacao_funcionamento", "localizacao",
+           "reg_cnas"] + COLS_FLAGS_ESCOLA + ["funcionarios", "prof_total_escola"] + COLS_EXTRA_ESCOLA
 COLS_INFRA = ["ano", "id_ie", "salas_existentes_perm", "salas_existentes_prov",
               "salas_utilizadas_no_estab", "salas_utilizadas_fora"]
 MEDIDAS_ETAPA = ["turmas", "turmas_multisseriadas", "matriculas", "matriculas_masc", "matriculas_fem",
-                 "abandono", "aprovados", "reprovados", "ano_referencia_rendimento",
+                 "abandono", "aprovados", "reprovados",
                  "prof_total", "prof_ate_fundamental", "prof_medio_magisterio", "prof_medio_outro",
                  "prof_superior_licenciatura", "prof_superior_sem_lic",
                  "prof_com_capacitacao", "prof_sem_capacitacao"]
-COLS_ETAPA = ["ano", "id_ie", "etapa", "turno"] + MEDIDAS_ETAPA
+COLS_ETAPA = ["ano", "id_ie", "etapa"] + MEDIDAS_ETAPA
 COLS_PNE_MOD = ["ano", "id_ie", "modalidade", "turmas", "alunos"]
 COLS_PNE_DEF = ["ano", "id_ie", "etapa", "deficiencia", "alunos"]
 
@@ -98,9 +82,11 @@ def mapa_turno(t: str) -> dict[tuple[str, str], list[str]]:
     return {
         ("pre", "turmas"): _seq(f"{t}PE11", "456"),
         ("pre", "matriculas"): _seq(f"{t}PE11", "ABC"),
-        # CA entra nos anos iniciais (CA = 1º ano do fundamental de 9 anos)
-        ("fund_ini", "turmas"): [f"{t}PE118"] + _seq(f"{t}EF11", "3456"),
-        ("fund_ini", "matriculas"): [f"{t}PE11E"] + _seq(f"{t}EF11", "CDEF"),
+        # CA é etapa própria em 1996; a soma CA + 1ª-4ª só acontece no núcleo
+        ("ca", "turmas"): [f"{t}PE118"],
+        ("ca", "matriculas"): [f"{t}PE11E"],
+        ("fund_ini", "turmas"): _seq(f"{t}EF11", "3456"),
+        ("fund_ini", "matriculas"): _seq(f"{t}EF11", "CDEF"),
         ("fund_fin", "turmas"): _seq(f"{t}EF11", "789A"),
         ("fund_fin", "matriculas"): _seq(f"{t}EF11", "GHIJ"),
         ("fund_total", "turmas_multisseriadas"): [f"{t}EF11B"],
@@ -112,7 +98,8 @@ def mapa_turno(t: str) -> dict[tuple[str, str], list[str]]:
 # matrículas por sexo (turno 'todos')
 SEXO = {
     "pre": (_seq("VPE41", "123"), _seq("VPE42", "123")),
-    "fund_ini": (["VPE414"] + _seq("VEF41", "1234"), ["VPE424"] + _seq("VEF42", "1234")),
+    "ca": (["VPE414"], ["VPE424"]),
+    "fund_ini": (_seq("VEF41", "1234"), _seq("VEF42", "1234")),
     "fund_fin": (_seq("VEF41", "5678"), _seq("VEF42", "5678")),
     "medio": (_seq("VEM41", "12345"), _seq("VEM42", "12345")),
 }
@@ -134,7 +121,8 @@ REND_MEDIO = {
 # professores: etapa -> prefixos (o 1º prefixo é "com capacitação/curso específico" no pré e no especial)
 PROF_PREFIXOS = {
     "pre": ["VDG12", "VDG13"],
-    "fund_ini": ["VDG14", "VDG15"],        # CA + 1ª a 4ª (atenção: pode contar 2x o mesmo professor)
+    "ca": ["VDG14"],                       # Classe de Alfabetização
+    "fund_ini": ["VDG15"],                 # 1ª a 4ª série
     "fund_fin": ["VDG16"],
     "medio": ["VDG17"],
     "especial": ["VDG18", "VDG19"],
@@ -142,6 +130,7 @@ PROF_PREFIXOS = {
     "supletivo_s2": ["VDG1B"],
 }
 PROF_COM_SEM = {"pre", "especial"}
+PROF_ESCOLA = _seq("VDG11", "1234567")     # professores da escola (todas as formações) -> prof_total_escola
 # dígito final = formação: 1 fund. incompleto, 2 fund. completo, 3 magistério, 4 outra (médio),
 # 5 licenciatura, 6 e 7 superior sem licenciatura
 PROF_FORMACAO = {
@@ -168,7 +157,7 @@ COLS_INFRA_ORIGEM = {"PERMANEN": "salas_existentes_perm", "PROVISOR": "salas_exi
 
 def variaveis_numericas() -> list[str]:
     """Todas as variáveis numéricas que o script consome (para ler só elas)."""
-    v: set[str] = {"FUNCION", *COLS_INFRA_ORIGEM}
+    v: set[str] = {"FUNCION", *COLS_INFRA_ORIGEM, *PROF_ESCOLA}
     for t in "DN":
         for cols in mapa_turno(t).values():
             v.update(cols)
@@ -228,22 +217,46 @@ def texto(s: pd.Series) -> pd.Series:
     return s.mask(s == "")
 
 
-def numero(df: pd.DataFrame, colunas: Iterable[str], rejeitados: dict[str, int]) -> pd.DataFrame:
-    """Converte colunas para float (vazio -> NaN); conta valores não vazios que não são número."""
+def numero(df: pd.DataFrame, colunas: Iterable[str]) -> pd.DataFrame:
+    """Converte colunas para float (vazio -> NaN). Valor não numérico NÃO é convertido: o script para e informa."""
     out = {}
     for c in colunas:
         bruto = texto(df[c])
         num = pd.to_numeric(bruto, errors="coerce")
-        ruim = int((bruto.notna() & num.isna()).sum())
-        if ruim:
-            rejeitados[c] += ruim
+        ruim = bruto.notna() & num.isna()
+        if ruim.any():
+            raise SystemExit(f"Valor não numérico na coluna {c}: {bruto[ruim].unique()[:5].tolist()} "
+                             f"({int(ruim.sum())} linhas). Nada foi alterado; corrija a origem ou decida o tratamento.")
         out[c] = num.astype("float64")
     return pd.DataFrame(out, index=df.index)
 
 
-def flag(s: pd.Series) -> pd.Series:
-    """'s'/'S' -> True (o arquivo usa s/n)."""
-    return s.astype("string").str.strip().str.lower().eq("s").fillna(False).astype(bool)
+def sn(s: pd.Series, nome: str) -> pd.Series:
+    """Flag do INEP: mantém 's' / 'n' como estão; vazio fica vazio. Outro valor é avisado e vira vazio."""
+    low = texto(s).str.lower()
+    ruim = low.notna() & ~low.isin(["s", "n"])
+    if ruim.any():
+        logger.warning("%s: %d valores diferentes de s/n (ex.: %s) -> ficaram vazios", nome, int(ruim.sum()),
+                       low[ruim].unique()[:5].tolist())
+    return low.where(~ruim)
+
+
+def ou(nome: str, *series: pd.Series) -> pd.Series:
+    """OR de flags s/n: 's' se alguma é 's'; senão 'n' se alguma é 'n'; senão vazio."""
+    d = pd.concat([sn(x, nome) for x in series], axis=1)
+    resultado = pd.Series(pd.NA, index=d.index, dtype="string")
+    resultado = resultado.mask(d.eq("n").any(axis=1), "n")
+    return resultado.mask(d.eq("s").any(axis=1), "s")
+
+
+def codificar(s: pd.Series, dominio: dict[str, int], nome: str) -> pd.Series:
+    """Texto de 1996 -> código do domínio. Vazio fica vazio; valor desconhecido faz o script parar."""
+    t = texto(s)
+    desconhecido = t.notna() & ~t.isin(dominio.keys())
+    if desconhecido.any():
+        raise SystemExit(f"{nome}: valores fora do domínio {t[desconhecido].unique()[:5].tolist()} "
+                         f"({int(desconhecido.sum())} linhas). Atualize o domínio em 01_dim.sql e neste script.")
+    return t.map(dominio).astype("Int64")
 
 
 def soma(df: pd.DataFrame, cols: list[str]) -> pd.Series:
@@ -255,28 +268,26 @@ def soma(df: pd.DataFrame, cols: list[str]) -> pd.Series:
 # 4. Construção das tabelas de um bloco (chunk)
 # ---------------------------------------------------------------------------
 def montar_ie(df: pd.DataFrame, num: pd.DataFrame, extra: pd.DataFrame) -> pd.DataFrame:
-    letras = pd.DataFrame({
-        "P": flag(df["NIVELPRE"]),
-        "I": flag(df["NIVELCA"]) | flag(df["NIV_F1A4_8"]),
-        "F": flag(df["NIV_F5A8_8"]),
-        "M": flag(df["NIVELMEDIO"]),
-    })
-    niveis = letras.apply(lambda r: "".join(k for k, v in r.items() if v), axis=1)
-    mod = pd.DataFrame({"R": flag(df["ENSREGULAR"]), "E": flag(df["ENSESPECIAL"]), "S": flag(df["ENSSUPLET"])})
-    modalidades = mod.apply(lambda r: "".join(k for k, v in r.items() if v), axis=1)
+    """df já traz cod_municipio (IBGE) e sigla_uf conferidos em ligar_municipio()."""
     out = pd.DataFrame({
         "ano": ANO,
         "id_ie": df["id_ie"],
-        "id_estavel": 0,
-        "cod_municipio": texto(df["CODMUNIC"]),
-        "sigla_uf": texto(df["SIGLA"]).str.upper(),
-        "dependencia": texto(df["DEP"]),
-        "localizacao": texto(df["LOC"]),
-        "cond_funcionamento": texto(df["CODFUNC"]),
+        "cod_municipio": df["cod_municipio"],
+        "sigla_uf": df["sigla_uf"],
+        "dependencia": codificar(df["DEP"], DOM_DEPENDENCIA, "DEP"),
+        "situacao_funcionamento": codificar(df["CODFUNC"], DOM_SITUACAO, "CODFUNC"),
+        "localizacao": codificar(df["LOC"], DOM_LOCALIZACAO, "LOC"),
         "reg_cnas": texto(df["REG_CNAS"]),
-        "niveis": niveis.replace("", pd.NA),
-        "modalidades": modalidades.replace("", pd.NA),
+        "nivel_pre": sn(df["NIVELPRE"], "NIVELPRE"),
+        "nivel_ca": sn(df["NIVELCA"], "NIVELCA"),
+        "nivel_fund_ini": sn(df["NIV_F1A4_8"], "NIV_F1A4_8"),
+        "nivel_fund_fin": sn(df["NIV_F5A8_8"], "NIV_F5A8_8"),
+        "nivel_medio": sn(df["NIVELMEDIO"], "NIVELMEDIO"),
+        "mod_regular": sn(df["ENSREGULAR"], "ENSREGULAR"),
+        "mod_especial": sn(df["ENSESPECIAL"], "ENSESPECIAL"),
+        "mod_supletivo": sn(df["ENSSUPLET"], "ENSSUPLET"),
         "funcionarios": num["FUNCION"],
+        "prof_total_escola": soma(num, PROF_ESCOLA),
     })
     out = out.merge(extra, left_on="id_ie", right_index=True, how="left")
     return out[COLS_IE]
@@ -290,61 +301,53 @@ def montar_infra(df: pd.DataFrame, num: pd.DataFrame) -> pd.DataFrame:
 
 
 def montar_etapa(df: pd.DataFrame, num: pd.DataFrame, conf: dict) -> pd.DataFrame:
-    """Acumula as medidas por (etapa, turno) e devolve a tabela longa do bloco."""
-    acc: dict[tuple[str, str], dict[str, pd.Series]] = defaultdict(dict)
+    """Uma linha por (escola, etapa). Os turnos são apenas SOMADOS (D + N), sem interpretar qual é qual."""
+    acc: dict[str, dict[str, pd.Series]] = defaultdict(dict)
 
-    # turmas e matrículas por turno
-    for t, nome in (("D", "diurno"), ("N", "noturno")):
-        for (etapa, medida), cols in mapa_turno(t).items():
-            acc[(etapa, nome)][medida] = soma(num, cols)
+    # turmas e matrículas: soma das colunas diurnas e noturnas
+    por_turno = {t: mapa_turno(t) for t in "DN"}
+    for (etapa, medida) in por_turno["D"]:
+        cols = por_turno["D"][(etapa, medida)] + por_turno["N"][(etapa, medida)]
+        acc[etapa][medida] = soma(num, cols)
 
-    # matrículas por sexo (turno 'todos')
+    # matrículas por sexo
     for etapa, (masc, fem) in SEXO.items():
-        acc[(etapa, "todos")]["matriculas_masc"] = soma(num, masc)
-        acc[(etapa, "todos")]["matriculas_fem"] = soma(num, fem)
+        acc[etapa]["matriculas_masc"] = soma(num, masc)
+        acc[etapa]["matriculas_fem"] = soma(num, fem)
 
-    # rendimento (a referência é o próprio ano de 1996)
+    # rendimento (a referência é o próprio ano de 1996): fundamental já sem turno; médio soma dos dois turnos
     for etapa, d in REND_FUND.items():
         for medida, cols in d.items():
-            acc[(etapa, "todos")][medida] = soma(num, cols)
-    for turno, d in REND_MEDIO.items():
-        for medida, cols in d.items():
-            acc[("medio", turno)][medida] = soma(num, cols)
+            acc[etapa][medida] = soma(num, cols)
+    for medida in ("abandono", "aprovados", "reprovados"):
+        acc["medio"][medida] = soma(num, [c for d in REND_MEDIO.values() for c in d[medida]])
 
-    # professores (turno 'todos')
+    # professores
     for etapa, prefixos in PROF_PREFIXOS.items():
         todas = [f"{p}{d}" for p in prefixos for d in "1234567"]
-        acc[(etapa, "todos")]["prof_total"] = soma(num, todas)
+        acc[etapa]["prof_total"] = soma(num, todas)
         for medida, digitos in PROF_FORMACAO.items():
-            acc[(etapa, "todos")][medida] = soma(num, [f"{p}{d}" for p in prefixos for d in digitos])
+            acc[etapa][medida] = soma(num, [f"{p}{d}" for p in prefixos for d in digitos])
         if etapa in PROF_COM_SEM:
-            acc[(etapa, "todos")]["prof_com_capacitacao"] = soma(num, [f"{prefixos[0]}{d}" for d in "1234567"])
-            acc[(etapa, "todos")]["prof_sem_capacitacao"] = soma(num, [f"{prefixos[1]}{d}" for d in "1234567"])
+            acc[etapa]["prof_com_capacitacao"] = soma(num, [f"{prefixos[0]}{d}" for d in "1234567"])
+            acc[etapa]["prof_sem_capacitacao"] = soma(num, [f"{prefixos[1]}{d}" for d in "1234567"])
 
-    # validação: matrículas D+N deveria ser igual a M+F
+    # validação: matrículas (D+N) deveria ser igual a M+F
     for etapa in SEXO:
-        d = acc[(etapa, "diurno")]["matriculas"]
-        n = acc[(etapa, "noturno")]["matriculas"]
-        por_turno = pd.concat([d, n], axis=1).sum(axis=1, min_count=1)
-        por_sexo = pd.concat([acc[(etapa, "todos")]["matriculas_masc"],
-                              acc[(etapa, "todos")]["matriculas_fem"]], axis=1).sum(axis=1, min_count=1)
-        ambos = por_turno.notna() & por_sexo.notna()
+        total = acc[etapa]["matriculas"]
+        por_sexo = pd.concat([acc[etapa]["matriculas_masc"], acc[etapa]["matriculas_fem"]], axis=1).sum(axis=1, min_count=1)
+        ambos = total.notna() & por_sexo.notna()
         conf[etapa]["comparaveis"] += int(ambos.sum())
-        conf[etapa]["iguais"] += int((por_turno[ambos] == por_sexo[ambos]).sum())
+        conf[etapa]["iguais"] += int((total[ambos] == por_sexo[ambos]).sum())
 
     partes = []
-    for (etapa, turno), medidas in acc.items():
-        bloco = pd.DataFrame(medidas)
-        bloco = bloco.dropna(how="all")
+    for etapa, medidas in acc.items():
+        bloco = pd.DataFrame(medidas).dropna(how="all")
         if bloco.empty:
             continue
         bloco.insert(0, "id_ie", df.loc[bloco.index, "id_ie"])
-        bloco.insert(0, "turno", turno)
         bloco.insert(0, "etapa", etapa)
         bloco.insert(0, "ano", ANO)
-        if {"abandono", "aprovados", "reprovados"} & set(medidas):
-            tem = bloco[[c for c in ("abandono", "aprovados", "reprovados") if c in bloco]].notna().any(axis=1)
-            bloco["ano_referencia_rendimento"] = pd.Series(ANO, index=bloco.index).where(tem)
         partes.append(bloco)
     if not partes:
         return pd.DataFrame(columns=COLS_ETAPA)
@@ -391,8 +394,7 @@ def localizar_arquivo_curso(pasta: Path, stem: str) -> Path | None:
     return achados[0] if achados else None
 
 
-def ler_curso(pasta: Path, stem: str, variaveis: list[str], encoding: str,
-              rejeitados: dict[str, int]) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+def ler_curso(pasta: Path, stem: str, variaveis: list[str], encoding: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
     """Devolve (chaves, números) alinhados; chaves = id_ie, cod_curso. None se o arquivo não existe."""
     caminho = localizar_arquivo_curso(pasta, stem)
     if caminho is None:
@@ -411,7 +413,7 @@ def ler_curso(pasta: Path, stem: str, variaveis: list[str], encoding: str,
     df = df[masc.notna()].reset_index(drop=True)
     chaves = pd.DataFrame({"id_ie": f"MASC{ANO}_" + texto(df["MASCARA"]), "cod_curso": texto(df["CODCURSO"])})
     logger.info("%s: %d linhas", caminho.name, len(df))
-    return chaves, numero(df, variaveis, rejeitados)
+    return chaves, numero(df, variaveis)
 
 
 def por_escola(chaves: pd.DataFrame, valores: pd.Series, nome: str) -> pd.Series:
@@ -419,26 +421,20 @@ def por_escola(chaves: pd.DataFrame, valores: pd.Series, nome: str) -> pd.Series
     return valores.groupby(chaves["id_ie"]).sum(min_count=1).rename(nome)
 
 
-def montar_extra_escola(pasta: Path, encoding: str, rejeitados: dict[str, int]) -> pd.DataFrame:
+def montar_extra_escola(pasta: Path, encoding: str) -> pd.DataFrame:
     """Colunas extras de `escola` (índice = id_ie), vindas dos arquivos de curso."""
     series: list[pd.Series] = []
-    cursos: list[pd.DataFrame] = []
 
-    em8 = ler_curso(pasta, ARQUIVO_EM8, EM8_MATRICULAS, encoding, rejeitados)
+    em8 = ler_curso(pasta, ARQUIVO_EM8, EM8_MATRICULAS, encoding)
     if em8:
         ch, nu = em8
         series.append(por_escola(ch, soma(nu, EM8_MATRICULAS), "tec_matriculas"))
-        cursos.append(ch.dropna(subset=["cod_curso"]))
-    em11 = ler_curso(pasta, ARQUIVO_EM11, EM11_CONCLUINTES, encoding, rejeitados)
+    em11 = ler_curso(pasta, ARQUIVO_EM11, EM11_CONCLUINTES, encoding)
     if em11:
         ch, nu = em11
         series.append(por_escola(ch, soma(nu, EM11_CONCLUINTES), "tec_concluintes_ant"))
-        cursos.append(ch.dropna(subset=["cod_curso"]))
-    if cursos:                                     # nº de cursos técnicos distintos da escola (EM8 ∪ EM11)
-        todos = pd.concat(cursos, ignore_index=True).drop_duplicates()
-        series.append(todos.groupby("id_ie").size().rename("tec_cursos"))
 
-    es6 = ler_curso(pasta, ARQUIVO_ES6, [v for par in ES6_SEMESTRES.values() for v in par], encoding, rejeitados)
+    es6 = ler_curso(pasta, ARQUIVO_ES6, [v for par in ES6_SEMESTRES.values() for v in par], encoding)
     if es6:
         ch, nu = es6
         for sem, (vm, vc) in ES6_SEMESTRES.items():
@@ -467,11 +463,10 @@ class Escritor:
     def escrever(self, df: pd.DataFrame) -> None:
         if df.empty:
             return
-        df = df[self.colunas].copy()
-        for c in df.columns:
-            if c not in ("ano",) and pd.api.types.is_float_dtype(df[c]):
-                df[c] = df[c].round().astype("Int64")
-        df.to_csv(self.tmp, mode="a", header=self._cabecalho, index=False, sep=self.sep, encoding="utf-8")
+        df = df[self.colunas]
+        # float como veio: inteiros saem sem ".0" (12), valores com decimais saem completos (12.5)
+        df.to_csv(self.tmp, mode="a", header=self._cabecalho, index=False, sep=self.sep, encoding="utf-8",
+                  float_format="%.15g")
         self._cabecalho = False
         self.linhas += len(df)
 
@@ -482,45 +477,33 @@ class Escritor:
 
 
 # ---------------------------------------------------------------------------
-# 6. Dimensões
+# 6. Municípios (dim/municipio.csv de gerar_dim.py)
 # ---------------------------------------------------------------------------
-def moda(s: pd.Series) -> str | None:
-    s = s.dropna()
-    return None if s.empty else str(s.value_counts().index[0])
+def carregar_municipios(caminho: Path) -> pd.DataFrame:
+    """CODMUNIC -> (cod_municipio IBGE, sigla_uf)."""
+    if not caminho.is_file():
+        raise SystemExit(f"{caminho} não encontrado. Rode antes: python gerar_dim.py")
+    d = pd.read_csv(caminho, dtype=str, encoding="utf-8")
+    d = d.dropna(subset=["codmunic_inep_9606"])
+    return d.set_index("codmunic_inep_9606")[["cod_municipio", "sigla_uf"]]
 
 
-def gravar_dimensoes(pares_mun: list[pd.DataFrame], pasta: Path, sep: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """pares_mun: contagens (cod_municipio, nome_municipio, sigla_uf, uf_nome, n) acumuladas por chunk."""
-    todos = pd.concat(pares_mun, ignore_index=True)
-    cont = todos.groupby(["cod_municipio", "nome_municipio", "sigla_uf", "nome_uf"], dropna=False, as_index=False)["n"].sum()
-
-    # município: um registro por cod_municipio (o mais frequente); avisa se há conflito
-    por_cod = cont.sort_values("n", ascending=False)
-    conflito_uf = cont.groupby("cod_municipio")["sigla_uf"].nunique()
-    conflito_nome = cont.groupby("cod_municipio")["nome_municipio"].nunique()
-    if (conflito_uf > 1).any():
-        logger.warning("%d CODMUNIC aparecem em mais de uma UF -> CODMUNIC é código LOCAL; a chave de "
-                       "municipio precisa ser (sigla_uf, cod_municipio). Exemplos: %s",
-                       int((conflito_uf > 1).sum()), list(conflito_uf[conflito_uf > 1].index[:5]))
-    if (conflito_nome > 1).any():
-        logger.warning("%d CODMUNIC com mais de um nome de município (mantido o mais frequente). Exemplos: %s",
-                       int((conflito_nome > 1).sum()), list(conflito_nome[conflito_nome > 1].index[:5]))
-    mun = (por_cod.drop_duplicates("cod_municipio")[["cod_municipio", "nome_municipio", "sigla_uf"]]
-           .sort_values("cod_municipio").reset_index(drop=True))
-
-    # estado: um registro por sigla; nome mais frequente
-    est = (cont.groupby("sigla_uf")["nome_uf"].apply(moda).reset_index())
-    est["co_uf"] = est["sigla_uf"].map(CO_UF_IBGE).astype("Int64")
-    desconhecidas = est.loc[est["co_uf"].isna(), "sigla_uf"].tolist()
-    if desconhecidas:
-        logger.warning("Siglas sem código IBGE conhecido: %s", desconhecidas)
-    est = est[COLS_ESTADO].sort_values("sigla_uf").reset_index(drop=True)
-
-    est.to_csv(pasta / "estado.csv", index=False, sep=sep, encoding="utf-8")
-    mun.to_csv(pasta / "municipio.csv", index=False, sep=sep, encoding="utf-8")
-    pd.DataFrame(DIM_ETAPA, columns=["etapa", "descricao", "etapa_ampla"]).to_csv(
-        pasta / "etapa.csv", index=False, sep=sep, encoding="utf-8")
-    return est, mun
+def ligar_municipio(chunk: pd.DataFrame, mapa: pd.DataFrame) -> pd.DataFrame:
+    """Troca CODMUNIC pelo código IBGE e confere a UF. Para o script se algo não casar."""
+    cod = texto(chunk["CODMUNIC"])
+    if cod.isna().any():
+        raise SystemExit(f"{int(cod.isna().sum())} escolas sem CODMUNIC "
+                         f"(ex.: {chunk.loc[cod.isna(), 'MASCARA'].head(5).tolist()})")
+    sem = ~cod.isin(mapa.index)
+    if sem.any():
+        raise SystemExit(f"CODMUNIC sem código IBGE em municipio.csv: {cod[sem].unique()[:10].tolist()}")
+    chunk["cod_municipio"] = cod.map(mapa["cod_municipio"]).values
+    chunk["sigla_uf"] = texto(chunk["SIGLA"]).str.upper().values
+    dif = chunk["sigla_uf"].values != cod.map(mapa["sigla_uf"]).values
+    if dif.any():
+        ex = chunk.loc[dif, ["MASCARA", "CODMUNIC", "sigla_uf"]].head(5).to_dict("records")
+        raise SystemExit(f"{int(dif.sum())} escolas com SIGLA diferente da UF do município (ex.: {ex})")
+    return chunk
 
 
 # ---------------------------------------------------------------------------
@@ -535,12 +518,12 @@ def main() -> int:
     ap.add_argument("--encoding", default="utf-8-sig")
     ap.add_argument("--sep-saida", default=",")
     ap.add_argument("--chunk", type=int, default=50_000, help="linhas por bloco de leitura")
-    ap.add_argument("--so-dimensoes", action="store_true", help="gera apenas estado, municipio e etapa")
+    ap.add_argument("--municipios", type=Path, default=MUNICIPIOS_PADRAO, help="municipio.csv de gerar_dim.py")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     entrada = localizar_entrada(args.entrada)
-    pasta = args.saida or entrada.parent
+    pasta = args.saida or Path("C:/dados_inep/data_cen/dados_processados/Microdados_1996")
     pasta.mkdir(parents=True, exist_ok=True)
     logger.info("Entrada: %s", entrada)
     logger.info("Saída  : %s", pasta)
@@ -549,7 +532,8 @@ def main() -> int:
     precisa = set(COLS_TEXTO) | set(numericas)
     validar_cabecalho(entrada, args.encoding, precisa)
 
-    escritores = {} if args.so_dimensoes else {
+    mapa_mun = carregar_municipios(args.municipios)
+    escritores = {
         "escola": Escritor(pasta, "escola", COLS_IE, args.sep_saida),
         "infraestrutura": Escritor(pasta, "infraestrutura", COLS_INFRA, args.sep_saida),
         "escola_etapa": Escritor(pasta, "escola_etapa", COLS_ETAPA, args.sep_saida),
@@ -558,14 +542,10 @@ def main() -> int:
     }
 
     vistos: set[str] = set()
-    pares_mun: list[pd.DataFrame] = []
-    rejeitados: dict[str, int] = defaultdict(int)
     conf = {e: {"comparaveis": 0, "iguais": 0} for e in SEXO}
-    lidas = sem_chave = duplicadas = sem_municipio = 0
+    lidas = 0
     t0 = time.perf_counter()
-    extra = pd.DataFrame(index=pd.Index([], name="id_ie"), columns=COLS_EXTRA_ESCOLA)
-    if not args.so_dimensoes:
-        extra = montar_extra_escola(pasta, args.encoding, rejeitados)
+    extra = montar_extra_escola(entrada.parent, args.encoding)
 
     leitor = pd.read_csv(entrada, sep=SEP_ENTRADA, encoding=args.encoding, encoding_errors="replace",
                          dtype=str, usecols=lambda c: _limpar_nome(c) in precisa, chunksize=args.chunk,
@@ -575,42 +555,26 @@ def main() -> int:
         lidas += len(chunk)
 
         masc = texto(chunk["MASCARA"])
-        sem_chave += int(masc.isna().sum())
-        chunk = chunk[masc.notna()].copy()
-        chunk["id_ie"] = f"MASC{ANO}_" + masc[masc.notna()]
-
+        if masc.isna().any():
+            raise SystemExit(f"{int(masc.isna().sum())} escolas sem MASCARA perto da linha {lidas}")
+        chunk["id_ie"] = f"MASC{ANO}_" + masc
         repetida = chunk["id_ie"].duplicated() | chunk["id_ie"].isin(vistos)
-        duplicadas += int(repetida.sum())
-        chunk = chunk[~repetida]
+        if repetida.any():
+            raise SystemExit(f"MASCARA repetida: {chunk.loc[repetida, 'MASCARA'].head(5).tolist()}")
         vistos.update(chunk["id_ie"])
+        chunk = ligar_municipio(chunk.reset_index(drop=True), mapa_mun)
 
-        cod = texto(chunk["CODMUNIC"])
-        sem_municipio += int(cod.isna().sum())
-        chunk = chunk[cod.notna()].reset_index(drop=True)
-        if chunk.empty:
-            continue
-
-        # dimensões (contagem por combinação, para escolher o valor mais frequente no fim)
-        pares = pd.DataFrame({
-            "cod_municipio": texto(chunk["CODMUNIC"]), "nome_municipio": texto(chunk["MUNIC"]),
-            "sigla_uf": texto(chunk["SIGLA"]).str.upper(), "nome_uf": texto(chunk["UF"]),
-        })
-        pares_mun.append(pares.groupby(list(pares.columns), dropna=False, as_index=False).size()
-                         .rename(columns={"size": "n"}))
-
-        if not args.so_dimensoes:
-            num = numero(chunk, numericas, rejeitados)
-            escritores["escola"].escrever(montar_ie(chunk, num, extra))
-            escritores["infraestrutura"].escrever(montar_infra(chunk, num))
-            escritores["escola_etapa"].escrever(montar_etapa(chunk, num, conf))
-            mod, de = montar_pne(chunk, num)
-            escritores["pne_modalidade"].escrever(mod)
-            escritores["pne_deficiencia"].escrever(de)
+        num = numero(chunk, numericas)
+        escritores["escola"].escrever(montar_ie(chunk, num, extra))
+        escritores["infraestrutura"].escrever(montar_infra(chunk, num))
+        escritores["escola_etapa"].escrever(montar_etapa(chunk, num, conf))
+        mod, de = montar_pne(chunk, num)
+        escritores["pne_modalidade"].escrever(mod)
+        escritores["pne_deficiencia"].escrever(de)
         logger.info("%d linhas lidas (%.0f s)", lidas, time.perf_counter() - t0)
 
-    if not pares_mun:
-        raise SystemExit("Nenhuma escola válida encontrada.")
-    est, mun = gravar_dimensoes(pares_mun, pasta, args.sep_saida)
+    if not vistos:
+        raise SystemExit("Nenhuma escola encontrada.")
     sem_escola = int((~extra.index.isin(vistos)).sum())
     if sem_escola:
         logger.warning("%d escolas dos arquivos EM8/EM11/ES6 não existem no CENSOESC e foram ignoradas", sem_escola)
@@ -619,16 +583,11 @@ def main() -> int:
 
     # ------------------------------ relatório ------------------------------
     print("\n" + "=" * 70)
-    print(f"Linhas lidas: {lidas} | sem MASCARA: {sem_chave} | MASCARA repetida: {duplicadas} | "
-          f"sem CODMUNIC: {sem_municipio}")
-    print(f"estado: {len(est)} | municipio: {len(mun)} | etapa: {len(DIM_ETAPA)}")
+    print(f"Escolas lidas: {lidas} (todas com MASCARA única e município IBGE)")
     for nome, e in escritores.items():
         print(f"{nome}: {e.linhas} linhas")
-    if rejeitados:
-        top = sorted(rejeitados.items(), key=lambda kv: -kv[1])[:8]
-        print(f"Valores numéricos inválidos (viraram vazio): {sum(rejeitados.values())} | maiores: {top}")
-    if not args.so_dimensoes:
-        print("\nValidação: matrículas D+N == M+F (por etapa, entre escolas com os dois valores)")
+    if conf:
+        print("\nValidação: matrículas (D+N somados) == M+F (por etapa, entre escolas com os dois valores)")
         for etapa, c in conf.items():
             pct = 100 * c["iguais"] / c["comparaveis"] if c["comparaveis"] else float("nan")
             print(f"  {etapa:9s} {c['iguais']:>7}/{c['comparaveis']:<7} iguais ({pct:.1f}%)")
