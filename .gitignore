@@ -1,4 +1,3 @@
 *.sql
 .venv
 *__pycache__
-*.csv
