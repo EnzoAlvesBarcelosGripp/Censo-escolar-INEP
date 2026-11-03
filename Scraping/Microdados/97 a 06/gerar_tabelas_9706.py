@@ -7,6 +7,8 @@ Entrada : <raiz>/<ano>/CENSOESC_<ano>.CSV (delimitador '|')
           + EDUCPROF_<ano> da mesma pasta (só escola.tec_matriculas; 1998 e 2004-06, ver ANOS_TECNICO)
 Saída   : <saida>/<ano>/escola.csv, infraestrutura.csv, escola_etapa.csv
           + <saida>/<ano>/mapa_variaveis.csv  (cada variável do CSV usada: tabela, etapa, coluna e regra)
+          + <saida>/escola.csv, infraestrutura.csv, escola_etapa.csv: os 10 anos juntos (entidade do bloco;
+            refeita no fim de cada execução, ou só ela com --so-consolidar)
           pne_modalidade / pne_deficiencia ainda NÃO são geradas (o contexto dos blocos VEE está só nos
           títulos do Leia-me, como era com os professores; falta a verificação).
 
@@ -817,6 +819,44 @@ def processar_ano(ano: int, args, dic: pd.DataFrame, mapa_mun: pd.DataFrame | No
     print(f"  arquivos em {pasta}")
 
 
+# ===========================================================================
+# 10. Consolidação: <saida>/<ano>/<tabela>.csv (unidade de reprocessamento)
+#     -> <saida>/<tabela>.csv (a entidade do bloco, para a carga no banco)
+# ===========================================================================
+TABELAS = ("escola", "infraestrutura", "escola_etapa")
+
+
+def consolidar(saida: Path) -> None:
+    """Concatena os anos 1997-2006 em um CSV por tabela, copiando o texto (sem carregar em memória).
+    Exige os 10 anos e o MESMO cabeçalho em todos; escreve em .tmp e troca no fim (nada pela metade).
+    Seguro porque a chave (ano, id_ie[, etapa]) já carrega o ano: anos diferentes nunca colidem."""
+    anos = range(1997, 2007)
+    faltam = [f"{a}/{t}.csv" for a in anos for t in TABELAS if not (saida / str(a) / f"{t}.csv").is_file()]
+    if faltam:
+        raise SystemExit(f"Consolidação cancelada: faltam {faltam[:6]}. Gere esses anos antes.")
+    for tabela in TABELAS:
+        final, tmp = saida / f"{tabela}.csv", saida / f"{tabela}.csv.tmp"
+        cab_ref, linhas = None, 0
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as out:
+                for ano in anos:
+                    with open(saida / str(ano) / f"{tabela}.csv", encoding="utf-8", newline="") as f:
+                        cab = f.readline()
+                        if cab_ref is None:
+                            cab_ref = cab
+                            out.write(cab)
+                        elif cab != cab_ref:
+                            raise SystemExit(f"{tabela}: cabeçalho de {ano} difere do de 1997; gere o ano de novo.")
+                        for linha in f:                 # copia linha a linha: memória constante
+                            out.write(linha)
+                            linhas += 1
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        os.replace(tmp, final)
+        logger.info("consolidado: %s (%d linhas, 1997-2006)", final, linhas)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--raiz", type=Path, default=RAIZ_PADRAO, help="pasta com as subpastas por ano")
@@ -829,7 +869,13 @@ def main() -> int:
     ap.add_argument("--sep-saida", default=",")
     ap.add_argument("--chunk", type=int, default=20_000, help="linhas por bloco (2004-06 têm ~3.800 colunas)")
     ap.add_argument("--so-mapa", action="store_true", help="só grava mapa_variaveis.csv (não lê os dados)")
+    ap.add_argument("--so-consolidar", action="store_true",
+                    help="não gera nada: só junta os anos já gerados em <saida>/<tabela>.csv")
     args = ap.parse_args()
+    if args.so_consolidar:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        consolidar(args.saida)
+        return 0
     if not (1997 <= args.ano_inicio <= args.ano_fim <= 2006):
         ap.error("o bloco vai de 1997 a 2006")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -839,6 +885,8 @@ def main() -> int:
     mapa_mun = None if args.so_mapa else carregar_municipios(args.municipios)
     for ano in range(args.ano_inicio, args.ano_fim + 1):
         processar_ano(ano, args, dic, mapa_mun)
+    if not args.so_mapa:
+        consolidar(args.saida)      # reprocessar um ano só também atualiza a entidade consolidada
     return 0
 
 

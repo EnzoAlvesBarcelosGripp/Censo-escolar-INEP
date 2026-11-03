@@ -3,7 +3,9 @@ Gera os CSVs do bloco 1996 (DDL 03_b1996.sql) a partir de CENSOESC_1996.CSV.
 
 Entrada : CENSOESC_1996.CSV (delimitador '|', uma linha por escola, ~800 colunas)
           + dim/municipio.csv gerado por gerar_dim.py (para trocar CODMUNIC pelo código IBGE)
-          + EM8_1996, EM11_1996 e ES6_1996 (mesma pasta do CENSOESC; colunas tec_* e supl_prof_* de escola)
+          + ES6_1996 (mesma pasta do CENSOESC; colunas supl_prof_* de escola)
+            tec_matriculas fica NULL em 1996: o EM8 traz a matrícula do ensino médio inteiro, não do técnico,
+            e o EM11 não tem equivalente nos outros anos (ver ANOS_TECNICO em gerar_tabelas_9706.py)
 Saída   : na mesma pasta do arquivo de entrada (…/1996/), um CSV por tabela do schema b1996:
             escola.csv, infraestrutura.csv, escola_etapa.csv, pne_modalidade.csv, pne_deficiencia.csv
           As dimensões (estado, município, domínios, etapas) não são geradas aqui: ver gerar_dim.py e 01_dim.sql.
@@ -47,8 +49,8 @@ DOM_DEPENDENCIA = {"Federal": 1, "Estadual": 2, "Municipal": 3, "Particular": 4}
 DOM_SITUACAO = {"Ativo": 1, "Paralisado": 2, "Extinto": 3}
 DOM_LOCALIZACAO = {"Urbana": 1, "Rural": 2}
 
-# agregados dos arquivos EM8/EM11/ES6 (grão escola x curso), somados por escola
-COLS_EXTRA_ESCOLA = ["tec_matriculas", "tec_concluintes_ant",
+# agregados do arquivo ES6 (grão escola x curso), somados por escola; tec_matriculas não tem fonte em 1996 (NULL)
+COLS_EXTRA_ESCOLA = ["tec_matriculas",
                      "supl_prof_matriculas_s1_ant", "supl_prof_concluintes_s1_ant",
                      "supl_prof_matriculas_s2_ant", "supl_prof_concluintes_s2_ant"]
 COLS_FLAGS_ESCOLA = ["nivel_pre", "nivel_ca", "nivel_fund_ini", "nivel_fund_fin", "nivel_medio",
@@ -381,11 +383,9 @@ def montar_pne(df: pd.DataFrame, num: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
 
 
 # ---------------------------------------------------------------------------
-# 4b. EM8, EM11, ES6 (grão escola x curso) agregados por escola
+# 4b. ES6 (grão escola x curso) agregado por escola
 # ---------------------------------------------------------------------------
-ARQUIVO_EM8, ARQUIVO_EM11, ARQUIVO_ES6 = "em8_1996", "em11_1996", "es6_1996"
-EM8_MATRICULAS = [f"EM81{i}" for i in "45678"]        # 1ª-4ª série + não seriado (matrícula de 1996)
-EM11_CONCLUINTES = [f"EM111{i}" for i in "12345"]     # 5 coortes somadas (concluintes de 1995)
+ARQUIVO_ES6 = "es6_1996"
 ES6_SEMESTRES = {1: ("ES611", "ES612"), 2: ("ES613", "ES614")}   # (matriculados, concluintes) - tudo de 1995
 
 
@@ -422,17 +422,8 @@ def por_escola(chaves: pd.DataFrame, valores: pd.Series, nome: str) -> pd.Series
 
 
 def montar_extra_escola(pasta: Path, encoding: str) -> pd.DataFrame:
-    """Colunas extras de `escola` (índice = id_ie), vindas dos arquivos de curso."""
+    """Colunas extras de `escola` (índice = id_ie), vindas do ES6. tec_matriculas sai vazia (reindex)."""
     series: list[pd.Series] = []
-
-    em8 = ler_curso(pasta, ARQUIVO_EM8, EM8_MATRICULAS, encoding)
-    if em8:
-        ch, nu = em8
-        series.append(por_escola(ch, soma(nu, EM8_MATRICULAS), "tec_matriculas"))
-    em11 = ler_curso(pasta, ARQUIVO_EM11, EM11_CONCLUINTES, encoding)
-    if em11:
-        ch, nu = em11
-        series.append(por_escola(ch, soma(nu, EM11_CONCLUINTES), "tec_concluintes_ant"))
 
     es6 = ler_curso(pasta, ARQUIVO_ES6, [v for par in ES6_SEMESTRES.values() for v in par], encoding)
     if es6:
@@ -577,7 +568,7 @@ def main() -> int:
         raise SystemExit("Nenhuma escola encontrada.")
     sem_escola = int((~extra.index.isin(vistos)).sum())
     if sem_escola:
-        logger.warning("%d escolas dos arquivos EM8/EM11/ES6 não existem no CENSOESC e foram ignoradas", sem_escola)
+        logger.warning("%d escolas do arquivo ES6 não existem no CENSOESC e foram ignoradas", sem_escola)
     for e in escritores.values():
         e.fechar()
 
