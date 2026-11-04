@@ -2,6 +2,7 @@
 Carrega no MySQL os CSVs gerados pelos geradores de tabelas (dim, 1996, 1997-2006 e 2007-2025).
 
 Entrada : <raiz>/dim/estado.csv e municipio.csv            (gerar_dim.py)
+          <raiz>/dim/item_infraestrutura*.csv               (gerar_catalogo_infra.py; bloco "catalogo")
           <raiz>/Microdados_1996/<tabela>.csv               (gerar_tabelas_1996.py)
           <raiz>/Microdados_9706/<tabela>.csv               (gerar_tabelas_9706.py, arquivos consolidados)
           <raiz>/Microdados_0725/<tabela>.csv               (gerar_tabelas_0725.py, arquivos consolidados)
@@ -22,6 +23,7 @@ Como funciona, em quatro passos:
 
 Exemplos:
   python carregar_mysql.py --conferir                  # só o passo 1: instantâneo, não mexe no banco
+  python carregar_mysql.py --conferir --faixas         # idem + lê os CSVs e confere se cada valor cabe no tipo da coluna
   python carregar_mysql.py                             # tudo: dim, 1996, 9706, 0725
   python carregar_mysql.py --blocos 0725               # só o bloco 2007-2025
   python carregar_mysql.py --blocos dim 1996 9706      # senha: variável de ambiente MYSQL_PWD ou prompt
@@ -64,6 +66,8 @@ class Bloco:
 
 BLOCOS: dict[str, Bloco] = {b.nome: b for b in (
     Bloco("dim", "dim", "dim", ("estado", "municipio"), upsert=True),
+    # catálogo do núcleo: ninguém além do núcleo aponta para ele -> é esvaziado e recarregado (de-para sempre atual)
+    Bloco("catalogo", "dim", "dim", ("item_infraestrutura", "item_infraestrutura_origem")),
     Bloco("1996", "b1996", "Microdados_1996",
           ("escola", "infraestrutura", "escola_etapa", "pne_modalidade", "pne_deficiencia")),
     Bloco("9706", "b9706", "Microdados_9706",
@@ -155,6 +159,83 @@ def conferir(cur, bloco: Bloco, raiz: Path, sep: str, contar: bool) -> list[Plan
             p.linhas = contar_linhas(p.csv)
         planos.append(p)
     return planos
+
+
+# ===========================================================================
+# 2b. Conferência de FAIXAS (--faixas): os valores cabem no tipo de cada coluna?
+# ===========================================================================
+LIMITES_INTEIROS: dict[tuple[str, bool], tuple[int, int]] = {
+    ("tinyint", False): (-2**7, 2**7 - 1), ("tinyint", True): (0, 2**8 - 1),
+    ("smallint", False): (-2**15, 2**15 - 1), ("smallint", True): (0, 2**16 - 1),
+    ("mediumint", False): (-2**23, 2**23 - 1), ("mediumint", True): (0, 2**24 - 1),
+    ("int", False): (-2**31, 2**31 - 1), ("int", True): (0, 2**32 - 1),
+    ("bigint", False): (-2**63, 2**63 - 1), ("bigint", True): (0, 2**64 - 1),
+}
+
+
+def regras_de_faixa(cur, banco: str, tabela: str) -> dict[str, tuple]:
+    """minúscula -> ('int', min, max, tipo) | ('dec', limite, tipo) | ('txt', tamanho, tipo). Só o que tem limite."""
+    cur.execute("SELECT column_name, data_type, column_type, character_maximum_length, numeric_precision, "
+                "numeric_scale FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+                (banco, tabela))
+    regras: dict[str, tuple] = {}
+    for nome, dt, ct, tam, prec, esc in cur.fetchall():
+        dt = dt.lower()
+        if dt in ("tinyint", "smallint", "mediumint", "int", "bigint"):
+            lo, hi = LIMITES_INTEIROS[(dt, "unsigned" in ct.lower())]
+            regras[nome.lower()] = ("int", lo, hi, ct)
+        elif dt == "decimal":
+            regras[nome.lower()] = ("dec", 10 ** (int(prec) - int(esc)), ct)
+        elif dt in ("char", "varchar"):
+            regras[nome.lower()] = ("txt", int(tam), ct)
+    return regras
+
+
+def conferir_faixas(cur, p: Plano, sep: str) -> None:
+    """Lê o CSV inteiro em blocos e compara cada coluna com o tipo do banco. Acrescenta a p.problemas uma linha
+    por coluna que não cabe (tipo, menor/maior valor, quantas linhas, 1 exemplo) ou que tem texto onde há número."""
+    import pandas as pd  # só aqui: a carga em si não precisa de pandas
+
+    regras = regras_de_faixa(cur, p.bloco.banco, p.tabela)
+    achados: dict[str, dict] = {}
+    t1 = time.perf_counter()
+    logger.info("%s.%s: conferindo faixas de %s colunas...", p.bloco.banco, p.tabela, len(p.colunas_csv))
+    for chunk in pd.read_csv(p.csv, sep=sep, dtype=str, encoding="utf-8-sig", keep_default_na=False,
+                             chunksize=250_000):
+        for col in chunk.columns:
+            r = regras.get(col.lower())
+            if r is None:
+                continue
+            s = chunk[col]
+            s = s[s != ""]
+            if s.empty:
+                continue
+            if r[0] == "txt":
+                n = s.str.len()
+                ruim = n > r[1]
+                if ruim.any():
+                    a = achados.setdefault(col, {"tipo": r[2], "n": 0, "max": 0, "ex": s[ruim].iloc[0][:30]})
+                    a["n"] += int(ruim.sum()); a["max"] = max(a["max"], int(n.max()))
+                continue
+            num = pd.to_numeric(s, errors="coerce")
+            texto = num.isna()
+            if texto.any():
+                a = achados.setdefault(col, {"tipo": r[-1], "n": 0, "ex": s[texto].iloc[0][:30]})
+                a["texto"] = a.get("texto", 0) + int(texto.sum())
+            lo, hi = (r[1], r[2]) if r[0] == "int" else (-r[1], r[1])
+            ruim = (num < lo) | (num > hi) if r[0] == "int" else (num.abs() >= r[1])
+            if ruim.any():
+                v = num[ruim]
+                a = achados.setdefault(col, {"tipo": r[-1], "n": 0, "ex": s[ruim].iloc[0][:30]})
+                a["n"] += int(ruim.sum())
+                a["min"] = min(a.get("min", float("inf")), float(v.min()))
+                a["max"] = max(a.get("max", float("-inf")), float(v.max()))
+    for col, a in achados.items():
+        extra = f", {a['texto']} não numérico(s)" if a.get("texto") else ""
+        faixa = f" (de {a['min']:.0f} a {a['max']:.0f})" if "min" in a else (f" (até {a['max']} caracteres)" if a.get("max") else "")
+        p.problemas.append(f"{col} {a['tipo']}: {a['n']} valor(es) fora da faixa{faixa}{extra}, ex.: {a['ex']!r}")
+    logger.info("%s.%s: faixas conferidas em %.0f s (%d coluna(s) com problema)", p.bloco.banco, p.tabela,
+                time.perf_counter() - t1, len(achados))
 
 
 # ===========================================================================
@@ -270,6 +351,11 @@ def main() -> int:
     ap.add_argument("--socket", default="", help="socket unix (só para testes em Linux)")
     ap.add_argument("--sep", default=",", help="separador dos CSVs (padrão: vírgula)")
     ap.add_argument("--conferir", action="store_true", help="só confere os arquivos e as colunas; não altera o banco")
+    ap.add_argument("--faixas", action="store_true",
+                    help="na conferência, lê os CSVs inteiros e confere se cada valor cabe no tipo da coluna do banco "
+                         "(demora, mas evita descobrir o erro só no fim da carga)")
+    ap.add_argument("--tabelas", nargs="+", default=None,
+                    help="só com --conferir: limita a conferência a estas tabelas (ex.: escola oferta)")
     ap.add_argument("--contar", action="store_true",
                     help="na conferência, conta também as linhas de cada CSV (lê os arquivos inteiros: demora)")
     args = ap.parse_args()
@@ -277,6 +363,8 @@ def main() -> int:
     if len(args.sep) != 1:
         ap.error("--sep deve ter um caractere")
     nomes = list(BLOCOS) if "todos" in args.blocos else [b for b in BLOCOS if b in args.blocos]
+    if args.tabelas and not args.conferir:
+        ap.error("--tabelas só pode ser usado com --conferir (carregar parte das tabelas deixaria chaves órfãs)")
 
     conn = conectar(args)
     cur = conn.cursor()
@@ -284,11 +372,16 @@ def main() -> int:
     # ---- passo 1: conferência de tudo antes de alterar qualquer coisa
     t0 = time.perf_counter()
     planos: dict[str, list[Plano]] = {n: conferir(cur, BLOCOS[n], args.raiz, args.sep, args.contar) for n in nomes}
+    if args.faixas:
+        for ps in planos.values():
+            for p in ps:
+                if not p.problemas and not p.pular and p.colunas_db and (not args.tabelas or p.tabela in args.tabelas):
+                    conferir_faixas(cur, p, args.sep)
     ruins = [p for ps in planos.values() for p in ps if p.problemas]
     print(f"\n{'tabela':32s}{'linhas':>12s}{'colunas':>9s}   situação")
     for n in nomes:
         for p in planos[n]:
-            situacao = "PULADA (sem CSV)" if p.pular else ("; ".join(p.problemas) if p.problemas else "ok")
+            situacao = "PULADA (sem CSV)" if p.pular else ("\n      - " + "\n      - ".join(p.problemas) if p.problemas else "ok")
             linhas = f"{p.linhas:,}" if p.linhas >= 0 else "-"
             print(f"{p.bloco.banco + '.' + p.tabela:32s}{linhas:>12s}{len(p.colunas_csv):>9}   {situacao}")
     print(f"(conferência em {time.perf_counter() - t0:.0f} s)")
