@@ -11,10 +11,18 @@ Como funciona, por bloco (1996, 9706, 0725):
      muito mais barato do que ler uma vez por item (seriam ~160 leituras).
   4. ANOS COLETADOS: um item só ganha linhas nos anos em que alguma escola respondeu (sim/não ou
      quantidade). Ano em que a coluna não existia fica sem linha, em vez de aparecer como "todas vazias".
-  5. GRAVAR em formato longo, item a item (DELETE dos anos do bloco + INSERT ... SELECT da tabela larga),
-     numa transação por bloco: rodar de novo dá o mesmo resultado (idempotente).
-  6. VERIFICAR antes do COMMIT: para cada item e ano, a soma de n_escolas é igual ao número de escolas do
-     bloco naquele ano; e sim + não + vazio = n_escolas.
+  5. GRAVAR em formato longo, item a item (INSERT ... SELECT da tabela larga), com COMMIT por item:
+     a transação não cresce sem parar e uma interrupção perde só o item em andamento.
+  6. VERIFICAR o bloco: para cada item e ano, a soma de n_escolas é igual ao número de escolas do bloco
+     naquele ano; e sim + não + vazio = n_escolas. Se falhar, o bloco fica marcado como inválido no log:
+     rode de novo (o início de cada execução apaga os anos do bloco, então nada se duplica).
+
+Carga rápida (versão 2, 05/11): durante a gravação a tabela fica SÓ com a chave primária. As FKs e os
+índices secundários (cada FK de município/dependência/situação cria o seu índice) são removidos antes e
+recriados no fim, de uma vez: construir um índice ordenando 65 milhões de linhas é muito mais rápido do que
+mantê-lo linha a linha. Depois de recriar, o script confere ele mesmo que não há valor sem par em dim
+(o que a FK faria na inserção). Com todos os blocos, a tabela é esvaziada com TRUNCATE (instantâneo) em vez
+de DELETE.
 
 Pré-requisitos: ddl nucleo.sql rodado; gerar_catalogo_infra.py + carregar_mysql.py --blocos catalogo.
 
@@ -39,6 +47,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("nucleo_infra")
 
 DESTINO = "nucleo.municipal_infraestrutura"
+
+# O que a tabela tem além da chave primária (igual ao ddl nucleo.sql). Removido para a carga e recriado no fim.
+INDICES = {"ix_nucleo_infra_municipio": "(ano, cod_municipio)"}
+FKS = {  # nome -> (coluna, tabela de dim, coluna de dim)
+    "fk_nucleo_infra_item": ("id_item", "dim.item_infraestrutura", "id_item"),
+    "fk_nucleo_infra_municipio": ("cod_municipio", "dim.municipio", "cod_municipio"),
+    "fk_nucleo_infra_dependencia": ("dependencia", "dim.dependencia", "codigo"),
+    "fk_nucleo_infra_situacao": ("situacao", "dim.situacao_funcionamento", "codigo"),
+}
 
 
 @dataclass(frozen=True)
@@ -165,11 +182,58 @@ def verificar(cur, base: Base, anos_item: dict[int, list[int]]) -> None:
     if pares != esperado_pares:
         problemas.append(f"{pares} pares (ano, item) gravados, esperados {esperado_pares}")
     if problemas:
-        raise SystemExit("Verificação falhou (nada foi confirmado):\n  - " + "\n  - ".join(problemas))
+        raise SystemExit("Verificação falhou:\n  - " + "\n  - ".join(problemas))
     logger.info("%s: verificação ok (%s linhas, %s pares ano x item)", base.banco, f"{linhas:,}", pares)
 
 
-def montar_bloco(conn, bloco: str, mostrar_sql: bool) -> None:
+def preparar_carga(conn) -> None:
+    """Deixa a tabela só com a PK: remove as FKs e depois todos os índices que não são a PK."""
+    cur = conn.cursor()
+    cur.execute("SELECT constraint_name FROM information_schema.table_constraints WHERE table_schema = 'nucleo' "
+                "AND table_name = 'municipal_infraestrutura' AND constraint_type = 'FOREIGN KEY'")
+    fks = [r[0] for r in cur.fetchall()]
+    for fk in fks:
+        cur.execute(f"ALTER TABLE {DESTINO} DROP FOREIGN KEY `{fk}`")
+    cur.execute("SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = 'nucleo' "
+                "AND table_name = 'municipal_infraestrutura' AND index_name <> 'PRIMARY'")
+    indices = [r[0] for r in cur.fetchall()]
+    for ix in indices:
+        cur.execute(f"ALTER TABLE {DESTINO} DROP INDEX `{ix}`")
+    logger.info("tabela pronta para carga rápida: %d FK(s) e %d índice(s) removidos (ficou só a PK)",
+                len(fks), len(indices))
+
+
+def finalizar_carga(conn) -> None:
+    """Recria índices e FKs de uma vez e confere, por conta própria, que todo valor tem par em dim."""
+    cur = conn.cursor()
+    t0 = time.perf_counter()
+    partes = [f"ADD INDEX `{n}` {cols}" for n, cols in INDICES.items()]
+    partes += [f"ADD CONSTRAINT `{n}` FOREIGN KEY ({c}) REFERENCES {t} ({tc})" for n, (c, t, tc) in FKS.items()]
+    logger.info("recriando %d índice(s) e %d FK(s) (constrói cada índice ordenando, de uma vez)...",
+                len(INDICES), len(FKS))
+    # Com FOREIGN_KEY_CHECKS=0 o MySQL cria as FKs no lugar (INPLACE), sem copiar a tabela inteira;
+    # a conferência que ele deixaria de fazer é feita logo abaixo.
+    cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+    try:
+        cur.execute(f"ALTER TABLE {DESTINO} " + ", ".join(partes))
+    finally:
+        cur.execute("SET FOREIGN_KEY_CHECKS = 1")
+    logger.info("índices e FKs recriados em %.0f s; conferindo valores sem par em dim...", time.perf_counter() - t0)
+    orfaos = []
+    for n, (c, t, tc) in FKS.items():
+        # DISTINCT usa o índice da própria FK: lê poucos milhares de valores, não 65 milhões de linhas
+        cur.execute(f"SELECT COUNT(*) FROM (SELECT DISTINCT {c} AS v FROM {DESTINO}) x "
+                    f"LEFT JOIN {t} d ON d.{tc} = x.v WHERE d.{tc} IS NULL")
+        (q,) = cur.fetchone()
+        if q:
+            orfaos.append(f"{c}: {q} valor(es) sem par em {t}")
+    if orfaos:
+        raise SystemExit("Valores sem par nas dimensões (a FK foi criada, mas os dados não fecham):\n  - "
+                         + "\n  - ".join(orfaos))
+    logger.info("conferência das FKs ok (%.0f s no total)", time.perf_counter() - t0)
+
+
+def montar_bloco(conn, bloco: str, mostrar_sql: bool, esvaziada: bool = False) -> None:
     base = BASES[bloco]
     cur = conn.cursor()
     itens = ler_itens(cur, bloco)
@@ -204,18 +268,28 @@ def montar_bloco(conn, bloco: str, mostrar_sql: bool) -> None:
     previstas = sum(len(v) for v in anos_item.values()) * grupos // max(1, len({a for v in anos_item.values() for a in v}))
     logger.info("%s: gravando ~%s linhas...", base.banco, f"{previstas:,}")
 
-    try:
+    if not esvaziada:
+        logger.info("%s: apagando os anos %s-%s que já existiam...", base.banco, *base.anos)
         cur.execute(f"DELETE FROM {DESTINO} WHERE ano BETWEEN %s AND %s", base.anos)
+        conn.commit()
+    n = 0
+    try:
         for n, it in enumerate(itens, 1):
             if anos_item[it.id_item]:
                 cur.execute(sql_inserir(it, anos_item[it.id_item]))
+                conn.commit()                    # COMMIT por item: a transação nunca passa de ~1 item
             if n % 20 == 0:
                 logger.info("%s: %d/%d itens gravados (%.0f s)", base.banco, n, len(itens), time.perf_counter() - t0)
-        verificar(cur, base, {k: v for k, v in anos_item.items() if v})
     except BaseException:
         conn.rollback()
+        logger.error("%s: interrompido no item %d de %d. Os itens anteriores ficaram gravados; rode de novo "
+                     "(os anos do bloco são apagados no início, nada se duplica).", base.banco, n, len(itens))
         raise
-    conn.commit()
+    try:
+        verificar(cur, base, {k: v for k, v in anos_item.items() if v})
+    except SystemExit as e:
+        raise SystemExit(f"{e}\nOs dados do bloco {base.banco} ficaram gravados, mas INCONSISTENTES: "
+                         "rode o script de novo para este bloco.") from None
     cur.execute("DROP TEMPORARY TABLE IF EXISTS nucleo.tmp_infra_larga")
     logger.info("%s: concluído em %.0f s", base.banco, time.perf_counter() - t0)
 
@@ -230,12 +304,35 @@ def main() -> int:
     ap.add_argument("--socket", default="", help="socket unix (só para testes em Linux)")
     args = ap.parse_args()
     blocos = list(BASES) if "todos" in args.blocos else [b for b in BASES if b in args.blocos]
+    if args.mostrar_sql:
+        conn = conectar(args)
+        try:
+            for b in blocos:
+                montar_bloco(conn, b, True)
+        finally:
+            conn.close()
+        return 0
     conn = conectar(args)
+    t0 = time.perf_counter()
     try:
+        # Sem log binário nesta sessão: as ~65 milhões de linhas não são gravadas de novo no binlog (~2,5 GB de
+        # disco e tempo de escrita). Este banco é local, sem replicação; o núcleo pode ser remontado a qualquer
+        # momento a partir dos blocos, então não há o que recuperar pelo binlog.
+        try:
+            conn.cursor().execute("SET SESSION sql_log_bin = 0")
+        except Exception as e:  # sem privilégio: segue com o binlog ligado
+            logger.warning("não consegui desligar o binlog desta sessão (%s); a carga segue normalmente", e)
+        preparar_carga(conn)
+        todos = blocos == list(BASES)
+        if todos:
+            conn.cursor().execute(f"TRUNCATE TABLE {DESTINO}")   # mais rápido que DELETE de 65 milhões de linhas
+            logger.info("todos os blocos: tabela esvaziada com TRUNCATE")
         for b in blocos:
-            montar_bloco(conn, b, args.mostrar_sql)
+            montar_bloco(conn, b, False, esvaziada=todos)
+        finalizar_carga(conn)
     finally:
         conn.close()
+    logger.info("núcleo de infraestrutura concluído em %.0f s", time.perf_counter() - t0)
     return 0
 
 
