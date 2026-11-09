@@ -6,7 +6,9 @@ Layout da aba (confirmado no cabeçalho técnico da linha 10):
 Saídas (modelo "meio-termo": longo por ano, vários valores por linha):
     escola_AF.csv       1 linha por escola (cadastro)
     ideb_escola_AF.csv  1 linha por escola x ano (NADA é descartado: escola-ano sem dado também é gravada)
-Uso:  python gerar_ideb_escola_af.py [--xlsx CAMINHO] [--saida PASTA]
+Uso:  python gerar_ideb_escola_af.py [--busca PASTA_2005-2025] [--xlsx CAMINHO_XLSX_OU_ZIP] [--saida PASTA]
+Entrada: <busca>\\divulgacao_anos_finais_escolas_2025.zip. Se for arquivo zip, o xlsx é extraído (uma vez) para
+<busca>\\_extraido\\<nome>\\; se for pasta já extraída (<nome>.zip\\<nome>\\<nome>.xlsx), é lido direto.
 """
 from __future__ import annotations
 
@@ -18,12 +20,13 @@ from pathlib import Path
 
 import openpyxl
 
-from comum_ideb import (FAMILIAS, UF_CODIGO, converter, csv_atomico, inteiro, normaliza, texto)
+from comum_ideb import (RAIZ_IDEB, UF_CODIGO, converter, csv_atomico, extrair_xlsx_do_zip, inteiro, localizar_xlsx,
+                        normaliza, texto)
 
 log = logging.getLogger("ideb_escola_af")
 
-XLSX_PADRAO = Path(r"C:\dados_inep\data_ind\ideb\resultados\2005-2025\_extraido\divulgacao_anos_finais_escolas_2025.xlsx")
 SAIDA_PADRAO = Path(r"C:\dados_inep\data_ind\processados\ideb-resultados")
+NOME_ARQUIVO = "divulgacao_anos_finais_escolas_2025"   # sem extensão
 ABA = "IDEB_Escolas (Anos_Finais)"
 ETAPA = "AF"
 LINHAS_ESPERADAS = 48_005          # contagem do explorador (conferência, não regra)
@@ -94,12 +97,20 @@ def validar_cabecalho(topo: list[list]) -> list[tuple[int, str, int]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--xlsx", type=Path, default=XLSX_PADRAO)
+    ap.add_argument("--busca", type=Path, default=RAIZ_IDEB, help="pasta 2005-2025 (onde estão os .zip)")
+    ap.add_argument("--xlsx", type=Path, default=None, help="caminho direto do .xlsx ou do .zip (ignora --busca)")
     ap.add_argument("--saida", type=Path, default=SAIDA_PADRAO)
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    wb = openpyxl.load_workbook(args.xlsx, read_only=True)
+    if args.xlsx is None:
+        xlsx = localizar_xlsx(NOME_ARQUIVO, args.busca)
+    elif args.xlsx.suffix.lower() == ".zip":
+        xlsx = extrair_xlsx_do_zip(args.xlsx, NOME_ARQUIVO, args.xlsx.parent / "_extraido" / NOME_ARQUIVO)
+    else:
+        xlsx = args.xlsx
+    log.info("lendo %s", xlsx)
+    wb = openpyxl.load_workbook(xlsx, read_only=True)
     try:
         if wb.sheetnames != [ABA]:
             raise ValueError(f"abas {wb.sheetnames} != [{ABA!r}]")
